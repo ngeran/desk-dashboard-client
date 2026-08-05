@@ -1,8 +1,8 @@
 """The Qt interface — three fastfetch-style panels across the strip.
 
-Clock (local, always live, dot-matrix font), Weather (local Open-Meteo, always
-live) and Calendar (backend-driven; OFFLINE until events arrive). Never blank: the
-first two render with no backend.
+Clock (local, dot-matrix font), Weather (local Open-Meteo) and Calendar (a local
+month grid with today highlighted) — all three render with no backend, so the
+screen is never blank.
 
 Layout = one row of three equal panels, sized for a wide strip (e.g. 1920×480);
 hero fonts scale to the screen. Thread model: Qt loop on the main thread; a
@@ -12,6 +12,7 @@ pushing data in via Qt signals (thread-safe, queued to the main thread).
 from __future__ import annotations
 
 import asyncio
+import calendar
 import os
 import threading
 from datetime import datetime
@@ -20,6 +21,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
@@ -205,68 +207,60 @@ class WeatherPanel(Panel):
 
 
 class CalendarPanel(Panel):
+    """A month grid with today highlighted. Purely local — no data source."""
+
     def __init__(self) -> None:
         super().__init__("CALENDAR", PALETTE["purple"])
-        self._show_state("offline")
+        self.set_live(True)  # always local
+        self._rendered: tuple | None = None
+        self._build()
 
-    def _show_state(self, reason: str) -> None:
+    def tick(self) -> None:
+        """Rebuild only when the day/month changes (cheap to check each second)."""
+        today = datetime.now()
+        key = (today.year, today.month, today.day)
+        if key != self._rendered:
+            self._rendered = key
+            self._build()
+
+    def _build(self) -> None:
         _clear(self.body)
-        label = QLabel(reason)
-        label.setObjectName("k")
-        label.setAlignment(Qt.AlignCenter)
-        self.body.addStretch()
-        self.body.addWidget(label)
-        self.body.addStretch()
+        now = datetime.now()
 
-    def set_events(self, events: list[dict] | None) -> None:
-        events = events or []
-        if not events:
-            self._show_state("no upcoming events")
-            return
-        self.set_live(True)
-        _clear(self.body)
-        today = datetime.now().date()
-        shown = 0
-        groups: dict = {}
-        for ev in events:
-            start = self._parse(ev.get("start"))
-            if start is None:
-                continue
-            groups.setdefault(start.date(), []).append((start, ev))
-        for day in sorted(groups):
-            if shown >= 12:
-                break
-            days_away = (day - today).days
-            head = "TODAY" if days_away == 0 else "TOMORROW" if days_away == 1 else day.strftime("%a %d %b").upper()
-            head_label = QLabel(head)
-            head_label.setObjectName("panelTitle")
-            head_label.setStyleSheet(f"color:{PALETTE['purple']};")
-            self.body.addWidget(head_label)
-            for start, ev in groups[day]:
-                if shown >= 12:
-                    break
-                shown += 1
-                when = "all day" if ev.get("all_day") else start.strftime("%H:%M")
-                when_label = QLabel(when)
-                when_label.setObjectName("v")
-                summary = QLabel(str(ev.get("summary") or "(no title)"))
-                summary.setObjectName("k")
-                summary.setWordWrap(True)
-                row = QHBoxLayout()
-                row.setSpacing(10)
-                row.addWidget(when_label)
-                row.addWidget(summary, 1)
-                self.body.addLayout(row)
-        self.body.addStretch()
+        title = QLabel(now.strftime("%B %Y").upper())  # e.g. "AUGUST 2026"
+        title.setObjectName("panelTitle")
+        title.setStyleSheet(f"color:{PALETTE['purple']};")
+        title.setAlignment(Qt.AlignCenter)
+        self.body.addWidget(title)
 
-    @staticmethod
-    def _parse(value) -> datetime | None:
-        if value is None:
-            return None
-        try:
-            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-        except ValueError:
-            return None
+        grid = QGridLayout()
+        grid.setSpacing(2)
+        grid.setContentsMargins(0, 10, 0, 0)
+        for col, letter in enumerate(["M", "T", "W", "T", "F", "S", "S"]):
+            head = QLabel(letter)
+            head.setObjectName("k")
+            head.setAlignment(Qt.AlignCenter)
+            grid.addWidget(head, 0, col)
+
+        first_weekday = datetime(now.year, now.month, 1).weekday()  # Monday = 0
+        days_in_month = calendar.monthrange(now.year, now.month)[1]
+        for day in range(1, days_in_month + 1):
+            index = first_weekday + day - 1
+            cell = QLabel(str(day))
+            cell.setAlignment(Qt.AlignCenter)
+            cell.setMinimumSize(26, 26)
+            if day == now.day:
+                cell.setStyleSheet(
+                    f"background:{PALETTE['purple']};color:#000;border-radius:13px;font-weight:700;"
+                )
+            else:
+                cell.setObjectName("v")
+            grid.addWidget(cell, index // 7 + 1, index % 7)
+
+        wrap = QWidget()
+        wrap.setLayout(grid)
+        self.body.addWidget(wrap, alignment=Qt.AlignCenter)
+        self.body.addStretch()
 
 
 class Bridge(QObject):
@@ -393,6 +387,7 @@ class MainWindow(QMainWindow):
 
     def _tick(self) -> None:
         self.clock_panel.tick()
+        self.calendar_panel.tick()
 
     def _on_station(self, data: dict) -> None:
         self.weather_panel.update(data)
@@ -407,11 +402,8 @@ class MainWindow(QMainWindow):
         self.conn.setStyleSheet(f"color:{color};")
 
     def _on_frame(self, frame: dict) -> None:
-        components = frame.get("components", {})
-        calendar = components.get("calendar")
-        if calendar is not None:
-            data = calendar.get("data")
-            self.calendar_panel.set_events(data.get("upcoming") if isinstance(data, dict) else None)
+        """Shell stream frame — kept for the connection indicator and future panels;
+        the calendar is now a local month grid, so this is unused for now."""
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.runner.stop()
