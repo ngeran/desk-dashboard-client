@@ -16,9 +16,12 @@ import asyncio
 import threading
 from datetime import datetime
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, Qt, QTimer, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QFrame,
+    QGraphicsDropShadowEffect,
+    QGraphicsOpacityEffect,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -30,6 +33,7 @@ from PySide6.QtWidgets import (
 
 from . import shell_client, weather
 from .config import (
+    ACCENT,
     CATEGORY_COLORS,
     CLOCK_FORMAT,
     DATE_FORMAT,
@@ -40,6 +44,7 @@ from .config import (
     WEATHER_REFRESH_SECONDS,
 )
 from .renderers import renderer_for
+from .widgets import DayProgressBar, PulseDot
 
 GRID_COLS = 3
 
@@ -79,7 +84,7 @@ class ComponentCard(QWidget):
 
         self.bar = QFrame()
         self.bar.setFixedHeight(3)
-        self.bar.setStyleSheet("border:none;")
+        self.bar.setStyleSheet(f"background:{accent}; border:none; border-radius:1px;")
         outer.addWidget(self.bar)
 
         header = QHBoxLayout()
@@ -106,7 +111,13 @@ class ComponentCard(QWidget):
             "degraded": PALETTE["yellow"],
             "unreachable": PALETTE["orange"],
         }.get(envelope.get("status"), self._accent)
-        self.bar.setStyleSheet(f"background:{bar_color}; border:none;")
+        # A fading gradient reads richer than a flat bar and gives the eye a
+        # direction — the card's "source" is the left edge, colour trails off.
+        self.bar.setStyleSheet(
+            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+            f"stop:0 {bar_color}, stop:0.6 {bar_color}, stop:1 transparent); "
+            "border:none; border-radius:1px;"
+        )
         _clear(self.body)
         renderer_for(envelope.get("component_id", "")).build_body(self.body, envelope.get("data"), manifest)
         self.setVisible(True)
@@ -134,6 +145,12 @@ class WeatherStation(QWidget):
         layout.addWidget(self.meta)
         layout.addStretch()
 
+        glow = QGraphicsDropShadowEffect(self.temp)
+        glow.setColor(QColor(ACCENT))
+        glow.setBlurRadius(28)
+        glow.setOffset(0, 0)
+        self.temp.setGraphicsEffect(glow)
+
     def update(self, data: dict) -> None:
         from .renderers.formatting import weather_text
 
@@ -142,8 +159,15 @@ class WeatherStation(QWidget):
         label, glyph = weather_text(data.get("code"))
         self.summary.setText(f"{glyph}  {label}")
         parts = []
-        if data.get("apparent") is not None:
-            parts.append(f"feels {data['apparent']:.0f}°")
+        apparent = data.get("apparent")
+        if apparent is not None and temp is not None:
+            delta = apparent - temp
+            if abs(delta) >= 1:
+                arrow = "▲" if delta > 0 else "▼"
+                color = PALETTE["orange"] if delta > 0 else PALETTE["blue"]
+                parts.append(f'feels {apparent:.0f}° <span style="color:{color};">{arrow}</span>')
+            else:
+                parts.append(f"feels {apparent:.0f}°")
         if data.get("humidity") is not None:
             parts.append(f"{data['humidity']:.0f}% hum")
         if data.get("wind_speed") is not None:
@@ -233,7 +257,22 @@ class MainWindow(QMainWindow):
         self.date = QLabel("")
         center.addWidget(self._mk(self.clock, "clock", Qt.AlignCenter))
         center.addWidget(self._mk(self.date, "date", Qt.AlignCenter))
+
+        # A hairline gradient bar tracking how much of the day has elapsed —
+        # ambient, not a headline element, but it makes the clock feel like
+        # it's tracking time rather than just displaying it.
+        self.day_bar = DayProgressBar(ACCENT)
+        center.addSpacing(6)
+        center.addWidget(self.day_bar)
         top.addLayout(center)
+
+        # Soft content-only glow on the hero clock — no filled panel behind
+        # it, so it stays OLED-safe while giving the display a focal point.
+        clock_glow = QGraphicsDropShadowEffect(self.clock)
+        clock_glow.setColor(QColor(ACCENT))
+        clock_glow.setBlurRadius(48)
+        clock_glow.setOffset(0, 0)
+        self.clock.setGraphicsEffect(clock_glow)
 
         top.addStretch(4)
         self.station = WeatherStation()
@@ -253,10 +292,16 @@ class MainWindow(QMainWindow):
 
         root.addLayout(top, 1)
 
-        # ── bottom: one-line status ────────────────────────────────────────────
+        # ── bottom: one-line status, led by a breathing dot when live ─────────
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        self.status_dot = PulseDot(PALETTE["dim"])
         self.conn = QLabel("starting…")
         self.conn.setObjectName("conn")
-        root.addWidget(self.conn)
+        status_row.addWidget(self.status_dot, alignment=Qt.AlignVCenter)
+        status_row.addWidget(self.conn, alignment=Qt.AlignVCenter)
+        status_row.addStretch()
+        root.addLayout(status_row)
 
         # clock tick (pure main thread)
         self._timer = QTimer(self)
@@ -303,8 +348,16 @@ class MainWindow(QMainWindow):
     # ── slots (run on the main thread) ─────────────────────────────────────────
     def _tick(self) -> None:
         now = datetime.now()
-        self.clock.setText(now.strftime(CLOCK_FORMAT))
+        time_str = now.strftime(CLOCK_FORMAT)
+        if ":" in time_str:
+            # Blink the colon on whole seconds — a small live-ness cue that
+            # doesn't shift layout (the glyph stays, only its colour changes).
+            colon_color = PALETTE["text"] if now.second % 2 == 0 else PALETTE["border"]
+            time_str = time_str.replace(":", f'<span style="color:{colon_color};">:</span>')
+        self.clock.setText(time_str)
         self.date.setText(now.strftime(DATE_FORMAT))
+        elapsed = now.hour * 3600 + now.minute * 60 + now.second
+        self.day_bar.set_fraction(elapsed / 86400)
 
     def _on_station(self, data: dict) -> None:
         self.station.update(data)
@@ -317,6 +370,8 @@ class MainWindow(QMainWindow):
             "disconnected": PALETTE["orange"],
         }.get(cls, PALETTE["dim"])
         self.conn.setStyleSheet(f"color:{color};")
+        self.status_dot.set_color(color)
+        self.status_dot.set_active(cls == "live")
 
     def _on_components(self, comps: list[dict]) -> None:
         self._manifests = {c["id"]: c for c in comps}
@@ -348,8 +403,23 @@ class MainWindow(QMainWindow):
     def _add_card(self, cid: str) -> None:
         manifest = self._manifests.get(cid, {})
         accent = CATEGORY_COLORS.get(manifest.get("category"), PALETTE["blue"])
-        self._cards[cid] = ComponentCard(accent)
+        card = ComponentCard(accent)
+        self._cards[cid] = card
         self._order.append(cid)
+        self._fade_in(card)
+
+    @staticmethod
+    def _fade_in(widget: QWidget) -> None:
+        """Soft fade-in for newly appearing cards instead of a hard pop-in."""
+        effect = QGraphicsOpacityEffect(widget)
+        widget.setGraphicsEffect(effect)
+        anim = QPropertyAnimation(effect, b"opacity", widget)
+        anim.setDuration(420)
+        anim.setStartValue(0.0)
+        anim.setEndValue(1.0)
+        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        widget._fade_anim = anim  # keep a reference alive for the animation's duration
+        anim.start()
 
     def _remove_card(self, cid: str) -> None:
         card = self._cards.pop(cid, None)

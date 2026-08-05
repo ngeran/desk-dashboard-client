@@ -44,6 +44,7 @@ PALETTE = {
     "black": "#000000",
     "panel": "#000000",      # keep panels pure black too — only content pixels emit
     "border": "#1c1c1c",
+    "border_dim": "#141414",  # near-invisible hairline, used for inactive dividers
     "text": "#e8eaed",
     "dim": "#8a8f98",
     "blue": "#4ca6ff",
@@ -51,6 +52,7 @@ PALETTE = {
     "yellow": "#ffd24a",
     "orange": "#ff8a3d",
     "purple": "#b985ff",
+    "teal": "#00dce5",       # Obsidian Core signature accent
 }
 # category -> accent colour (used for card side-marks + section labels).
 CATEGORY_COLORS = {
@@ -58,3 +60,7 @@ CATEGORY_COLORS = {
     "environment": PALETTE["green"],
     "personal": PALETTE["purple"],
 }
+# The dashboard's signature accent — used for the clock's glow and the
+# day-progress bar, the two "always-on" chrome elements every other screen
+# in Obsidian Core keys off of.
+ACCENT = PALETTE["teal"]
