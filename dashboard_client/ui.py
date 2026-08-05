@@ -1,21 +1,23 @@
 """The Qt interface — three fastfetch-style panels across the strip.
 
-Clock (local, always live), Weather (local Open-Meteo, always live) and Calendar
-(backend-driven; shows an OFFLINE state until the shell is up). The screen is
-never blank: the first two panels render with no backend.
+Clock (local, always live, dot-matrix font), Weather (local Open-Meteo, always
+live) and Calendar (backend-driven; OFFLINE until events arrive). Never blank: the
+first two render with no backend.
 
 Layout = one row of three equal panels, sized for a wide strip (e.g. 1920×480);
-fonts scale to the screen. Thread model: Qt loop on the main thread; a background
-asyncio thread fetches weather and consumes the shell's WS stream, pushing data in
-via Qt signals (thread-safe, queued to the main thread).
+hero fonts scale to the screen. Thread model: Qt loop on the main thread; a
+background asyncio thread fetches weather and consumes the shell's WS stream,
+pushing data in via Qt signals (thread-safe, queued to the main thread).
 """
 from __future__ import annotations
 
 import asyncio
+import os
 import threading
 from datetime import datetime
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QFontDatabase
 from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -29,6 +31,8 @@ from PySide6.QtWidgets import (
 from . import shell_client, weather
 from .config import LATITUDE, LONGITUDE, PALETTE, SHELL_URL, WEATHER_REFRESH_SECONDS
 from .renderers.formatting import weather_text
+
+_FONT_DIR = os.path.join(os.path.dirname(__file__), "assets", "fonts")
 
 
 def _clear(layout: QVBoxLayout) -> None:
@@ -45,7 +49,6 @@ def _clear(layout: QVBoxLayout) -> None:
 
 
 def _bar(accent: str, width: int | None = None) -> QProgressBar:
-    """A thin, label-less progress bar with an accent-coloured fill."""
     bar = QProgressBar()
     bar.setRange(0, 100)
     bar.setTextVisible(False)
@@ -60,7 +63,7 @@ def _bar(accent: str, width: int | None = None) -> QProgressBar:
 
 
 class Panel(QFrame):
-    """A bordered card: header (accent square + title + LIVE/OFFLINE badge) + body."""
+    """Bordered card: header (accent square + title + LIVE/OFFLINE badge) + body."""
 
     def __init__(self, title: str, accent: str) -> None:
         super().__init__()
@@ -99,7 +102,7 @@ class Panel(QFrame):
 class ClockPanel(Panel):
     def __init__(self) -> None:
         super().__init__("CLOCK", PALETTE["blue"])
-        self.set_live(True)  # always local
+        self.set_live(True)
         self.time = QLabel("")
         self.time.setObjectName("clockBig")
         self.time.setAlignment(Qt.AlignCenter)
@@ -136,6 +139,9 @@ class WeatherPanel(Panel):
         self.temp = QLabel("—")
         self.temp.setObjectName("clockBig")
         self.temp.setAlignment(Qt.AlignCenter)
+        self.icon = QLabel("·")
+        self.icon.setObjectName("weatherIcon")
+        self.icon.setAlignment(Qt.AlignCenter)
         self.cond = QLabel("")
         self.cond.setObjectName("v")
         self.cond.setAlignment(Qt.AlignCenter)
@@ -146,8 +152,17 @@ class WeatherPanel(Panel):
         self.hum_bar = _bar(PALETTE["green"])
         self.hum_label = QLabel("")
         self.hum_label.setObjectName("k")
+
+        # big temp + big icon side by side, condition text beneath
+        top = QHBoxLayout()
+        top.setSpacing(8)
+        top.addStretch()
+        top.addWidget(self.temp)
+        top.addWidget(self.icon)
+        top.addStretch()
+
         self.body.addStretch()
-        self.body.addWidget(self.temp)
+        self.body.addLayout(top)
         self.body.addWidget(self.cond)
         self.body.addStretch()
         self.body.addLayout(self._row("FEELS", self.feels_v))
@@ -174,7 +189,8 @@ class WeatherPanel(Panel):
         temp = data.get("temperature")
         self.temp.setText(f"{temp:.0f}°" if temp is not None else "—")
         label, glyph = weather_text(data.get("code"))
-        self.cond.setText(f"{glyph}  {label}")
+        self.icon.setText(glyph)
+        self.cond.setText(label)
         apparent = data.get("apparent")
         self.feels_v.setText(f"{apparent:.0f}°" if apparent is not None else "—")
         wind = data.get("wind_speed")
@@ -191,9 +207,9 @@ class WeatherPanel(Panel):
 class CalendarPanel(Panel):
     def __init__(self) -> None:
         super().__init__("CALENDAR", PALETTE["purple"])
-        self._show_empty("offline")
+        self._show_state("offline")
 
-    def _show_empty(self, reason: str) -> None:
+    def _show_state(self, reason: str) -> None:
         _clear(self.body)
         label = QLabel(reason)
         label.setObjectName("k")
@@ -202,10 +218,10 @@ class CalendarPanel(Panel):
         self.body.addWidget(label)
         self.body.addStretch()
 
-    def update(self, events: list[dict] | None) -> None:
+    def set_events(self, events: list[dict] | None) -> None:
         events = events or []
         if not events:
-            self._show_empty("no upcoming events")
+            self._show_state("no upcoming events")
             return
         self.set_live(True)
         _clear(self.body)
@@ -280,7 +296,7 @@ class BackgroundRunner(threading.Thread):
         while not self._stop.is_set():
             try:
                 self.bridge.station.emit(await weather.fetch(LATITUDE, LONGITUDE, WEATHER_REFRESH_SECONDS))
-            except Exception:  # noqa: BLE001 — keep the last reading on failure
+            except Exception:  # noqa: BLE001
                 pass
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=WEATHER_REFRESH_SECONDS)
@@ -309,6 +325,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("desk-dashboard")
         self._sized = False
+        self._dotted = self._load_dotted_font()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -342,7 +359,14 @@ class MainWindow(QMainWindow):
         self.runner = BackgroundRunner(self.bridge)
         self.runner.start()
 
-    # ── screen-adaptive sizing ─────────────────────────────────────────────────
+    @staticmethod
+    def _load_dotted_font() -> str:
+        """Load the bundled VT323 dot-matrix font; return its family (fallback VT323)."""
+        path = os.path.join(_FONT_DIR, "VT323-Regular.ttf")
+        font_id = QFontDatabase.addApplicationFont(path)
+        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+        return families[0] if families else "VT323"
+
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         if not self._sized:
@@ -353,17 +377,20 @@ class MainWindow(QMainWindow):
         screen = self.screen()
         height = screen.size().height() if screen else 480
 
-        def scale(label: QLabel, ratio: float, lo: int, hi: int) -> None:
+        def scale(label: QLabel, ratio: float, lo: int, hi: int, family: str | None = None) -> None:
             font = label.font()
             font.setPixelSize(max(lo, min(int(height * ratio), hi)))
+            if family is not None:
+                font.setFamily(family)
             label.setFont(font)
 
-        scale(self.clock_panel.time, 0.40, 80, 220)
+        scale(self.clock_panel.time, 0.42, 80, 230, family=self._dotted)   # dot-matrix clock
         scale(self.clock_panel.date, 0.06, 12, 22)
-        scale(self.weather_panel.temp, 0.30, 56, 150)
-        scale(self.weather_panel.cond, 0.06, 12, 26)
+        scale(self.clock_panel.day_label, 0.045, 11, 16, family=self._dotted)
+        scale(self.weather_panel.temp, 0.26, 56, 140)
+        scale(self.weather_panel.icon, 0.22, 50, 130)                       # big weather glyph
+        scale(self.weather_panel.cond, 0.055, 12, 24)
 
-    # ── slots ──────────────────────────────────────────────────────────────────
     def _tick(self) -> None:
         self.clock_panel.tick()
 
@@ -384,7 +411,7 @@ class MainWindow(QMainWindow):
         calendar = components.get("calendar")
         if calendar is not None:
             data = calendar.get("data")
-            self.calendar_panel.update(data.get("upcoming") if isinstance(data, dict) else None)
+            self.calendar_panel.set_events(data.get("upcoming") if isinstance(data, dict) else None)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.runner.stop()
