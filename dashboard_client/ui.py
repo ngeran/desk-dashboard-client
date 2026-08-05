@@ -1,13 +1,14 @@
 """The Qt interface — three fastfetch-style panels across the strip.
 
-Clock (local, dot-matrix font), Weather (local Open-Meteo) and Calendar (a local
-month grid with today highlighted) — all three render with no backend, so the
-screen is never blank.
+Weather (left), Clock (center), Calendar (right). Clock + Weather + Calendar are
+all local, so the screen is never blank. The clock font is selectable via the
+CLOCK_FONT env var (any bundled under assets/fonts/). Layout is one row of three
+equal panels sized for a wide strip (e.g. 1920×480); hero fonts scale to the
+screen, and the calendar grid expands to fill its panel.
 
-Layout = one row of three equal panels, sized for a wide strip (e.g. 1920×480);
-hero fonts scale to the screen. Thread model: Qt loop on the main thread; a
-background asyncio thread fetches weather and consumes the shell's WS stream,
-pushing data in via Qt signals (thread-safe, queued to the main thread).
+Thread model: Qt loop on the main thread; a background asyncio thread fetches
+weather and consumes the shell's WS stream (kept for the connection indicator +
+future panels), pushing data via Qt signals.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import threading
 from datetime import datetime
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
-from PySide6.QtGui import QFontDatabase
+from PySide6.QtGui import QFont, QFontDatabase
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -26,19 +27,19 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QProgressBar,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from . import shell_client, weather
-from .config import LATITUDE, LONGITUDE, PALETTE, SHELL_URL, WEATHER_REFRESH_SECONDS
+from .config import CLOCK_FONT, LATITUDE, LONGITUDE, PALETTE, SHELL_URL, WEATHER_REFRESH_SECONDS
 from .renderers.formatting import weather_text
 
 _FONT_DIR = os.path.join(os.path.dirname(__file__), "assets", "fonts")
 
 
 def _clear(layout: QVBoxLayout) -> None:
-    """Delete every child widget/layout of ``layout`` (for repopulation)."""
     while layout.count():
         item = layout.takeAt(0)
         child = item.widget() or item.layout()
@@ -65,8 +66,6 @@ def _bar(accent: str, width: int | None = None) -> QProgressBar:
 
 
 class Panel(QFrame):
-    """Bordered card: header (accent square + title + LIVE/OFFLINE badge) + body."""
-
     def __init__(self, title: str, accent: str) -> None:
         super().__init__()
         self.setObjectName("panel")
@@ -155,7 +154,6 @@ class WeatherPanel(Panel):
         self.hum_label = QLabel("")
         self.hum_label.setObjectName("k")
 
-        # big temp + big icon side by side, condition text beneath
         top = QHBoxLayout()
         top.setSpacing(8)
         top.addStretch()
@@ -207,21 +205,34 @@ class WeatherPanel(Panel):
 
 
 class CalendarPanel(Panel):
-    """A month grid with today highlighted. Purely local — no data source."""
+    """A month grid with today highlighted. Expands to fill the panel; purely local."""
 
     def __init__(self) -> None:
         super().__init__("CALENDAR", PALETTE["purple"])
-        self.set_live(True)  # always local
+        self.set_live(True)
         self._rendered: tuple | None = None
+        self._day_font = 24
+        self._head_font = 13
         self._build()
 
+    def configure(self, day_font: int, head_font: int) -> None:
+        if day_font != self._day_font or head_font != self._head_font:
+            self._day_font = day_font
+            self._head_font = head_font
+            self._rendered = None
+            self._build()
+
     def tick(self) -> None:
-        """Rebuild only when the day/month changes (cheap to check each second)."""
-        today = datetime.now()
-        key = (today.year, today.month, today.day)
+        now = datetime.now()
+        key = (now.year, now.month, now.day)
         if key != self._rendered:
             self._rendered = key
             self._build()
+
+    def _mkfont(self, px: int) -> QFont:
+        font = QFont("DejaVu Sans Mono")
+        font.setPixelSize(px)
+        return font
 
     def _build(self) -> None:
         _clear(self.body)
@@ -234,33 +245,38 @@ class CalendarPanel(Panel):
         self.body.addWidget(title)
 
         grid = QGridLayout()
-        grid.setSpacing(2)
-        grid.setContentsMargins(0, 10, 0, 0)
+        grid.setSpacing(4)
+        grid.setContentsMargins(0, 8, 0, 0)
         for col, letter in enumerate(["M", "T", "W", "T", "F", "S", "S"]):
+            grid.setColumnStretch(col, 1)
             head = QLabel(letter)
             head.setObjectName("k")
             head.setAlignment(Qt.AlignCenter)
+            head.setFont(self._mkfont(self._head_font))
             grid.addWidget(head, 0, col)
 
         first_weekday = datetime(now.year, now.month, 1).weekday()  # Monday = 0
         days_in_month = calendar.monthrange(now.year, now.month)[1]
         for day in range(1, days_in_month + 1):
             index = first_weekday + day - 1
+            r, c = index // 7 + 1, index % 7
+            grid.setRowStretch(r, 1)
             cell = QLabel(str(day))
             cell.setAlignment(Qt.AlignCenter)
-            cell.setMinimumSize(26, 26)
+            cell.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+            cell.setFont(self._mkfont(self._day_font))
             if day == now.day:
                 cell.setStyleSheet(
-                    f"background:{PALETTE['purple']};color:#000;border-radius:13px;font-weight:700;"
+                    f"background:{PALETTE['purple']};color:#000;border-radius:10px;font-weight:700;"
                 )
             else:
-                cell.setObjectName("v")
-            grid.addWidget(cell, index // 7 + 1, index % 7)
+                cell.setStyleSheet(f"color:{PALETTE['text']};")
+            grid.addWidget(cell, r, c)
 
         wrap = QWidget()
         wrap.setLayout(grid)
-        self.body.addWidget(wrap, alignment=Qt.AlignCenter)
-        self.body.addStretch()
+        wrap.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.body.addWidget(wrap, 1)  # stretch → the grid fills the panel
 
 
 class Bridge(QObject):
@@ -319,7 +335,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("desk-dashboard")
         self._sized = False
-        self._dotted = self._load_dotted_font()
+        self._clock_family = self._load_clock_font()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -329,11 +345,11 @@ class MainWindow(QMainWindow):
 
         row = QHBoxLayout()
         row.setSpacing(16)
-        self.clock_panel = ClockPanel()
         self.weather_panel = WeatherPanel()
+        self.clock_panel = ClockPanel()
         self.calendar_panel = CalendarPanel()
-        row.addWidget(self.clock_panel, 1)
         row.addWidget(self.weather_panel, 1)
+        row.addWidget(self.clock_panel, 1)
         row.addWidget(self.calendar_panel, 1)
         outer.addLayout(row, 1)
 
@@ -354,11 +370,18 @@ class MainWindow(QMainWindow):
         self.runner.start()
 
     @staticmethod
-    def _load_dotted_font() -> str:
-        """Load the bundled VT323 dot-matrix font; return its family (fallback VT323)."""
-        path = os.path.join(_FONT_DIR, "VT323-Regular.ttf")
-        font_id = QFontDatabase.addApplicationFont(path)
-        families = QFontDatabase.applicationFontFamilies(font_id) if font_id >= 0 else []
+    def _load_clock_font() -> str:
+        """Load every bundled font; return the family matching CLOCK_FONT (or the first)."""
+        families: list[str] = []
+        for name in sorted(os.listdir(_FONT_DIR)):
+            if not name.lower().endswith(".ttf"):
+                continue
+            font_id = QFontDatabase.addApplicationFont(os.path.join(_FONT_DIR, name))
+            families.extend(QFontDatabase.applicationFontFamilies(font_id))
+        wanted = CLOCK_FONT.lower()
+        for fam in families:
+            if wanted in fam.lower():
+                return fam
         return families[0] if families else "VT323"
 
     def showEvent(self, event) -> None:  # noqa: N802
@@ -378,12 +401,17 @@ class MainWindow(QMainWindow):
                 font.setFamily(family)
             label.setFont(font)
 
-        scale(self.clock_panel.time, 0.42, 80, 230, family=self._dotted)   # dot-matrix clock
+        scale(self.clock_panel.time, 0.42, 80, 230, family=self._clock_family)
         scale(self.clock_panel.date, 0.06, 12, 22)
-        scale(self.clock_panel.day_label, 0.045, 11, 16, family=self._dotted)
+        scale(self.clock_panel.day_label, 0.045, 11, 16, family=self._clock_family)
         scale(self.weather_panel.temp, 0.26, 56, 140)
-        scale(self.weather_panel.icon, 0.22, 50, 130)                       # big weather glyph
+        scale(self.weather_panel.icon, 0.22, 50, 130)
         scale(self.weather_panel.cond, 0.055, 12, 24)
+        # calendar fills its panel; scale its day + header fonts to the screen
+        self.calendar_panel.configure(
+            day_font=max(18, min(int(height * 0.05), 40)),
+            head_font=max(11, min(int(height * 0.03), 18)),
+        )
 
     def _tick(self) -> None:
         self.clock_panel.tick()
@@ -402,8 +430,7 @@ class MainWindow(QMainWindow):
         self.conn.setStyleSheet(f"color:{color};")
 
     def _on_frame(self, frame: dict) -> None:
-        """Shell stream frame — kept for the connection indicator and future panels;
-        the calendar is now a local month grid, so this is unused for now."""
+        """Shell stream frame — unused for now (all three panels are local)."""
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self.runner.stop()
