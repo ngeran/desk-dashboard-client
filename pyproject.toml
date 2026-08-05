@@ -1,0 +1,20 @@
+# desk-dashboard Pi display client — native Python (PySide6/Qt), offline-first.
+#
+# Runs directly on the Pi (64-bit Raspberry Pi OS): `uv sync && uv run dashboard-client`.
+# Not a container — it's the display tier, consuming the shell over the LAN.
+[project]
+name = "desk-dashboard-client"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6",          # Qt GUI (true-black OLED, QSS theming, great fonts)
+    "httpx",            # direct Open-Meteo fetch (offline weather) + GET /components
+    "websockets",       # shell /stream consumer
+    "structlog",        # structured logs, matching the backend
+]
+
+[tool.uv]
+package = true
+
+[project.scripts]
+dashboard-client = "dashboard_client.__main__:main"
