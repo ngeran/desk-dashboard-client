@@ -1,9 +1,14 @@
-"""The Qt interface: an always-on clock + weather station, plus a dynamic grid of
-component cards rendered through the modular registry.
+"""The Qt interface — a clock-first display sized to the screen.
 
-Thread model: the Qt event loop runs on the main thread; a background asyncio
-thread fetches weather (direct) and consumes the shell's WS stream, pushing
-results into the UI via Qt signals (thread-safe, queued to the main thread).
+Layout is built for a wide strip (e.g. 1920×480): a large centered clock with the
+date beneath it, the weather station to the right, component cards further right
+(only when the backend is up), and a one-line status at the bottom. Fonts scale to
+the screen so the clock fills a short display. The screen is never blank: the
+clock + weather station are local, so they render even with the backend down.
+
+Thread model: Qt event loop on the main thread; a background asyncio thread
+fetches weather and consumes the shell's WS stream, pushing results in via Qt
+signals (thread-safe, queued to the main thread).
 """
 from __future__ import annotations
 
@@ -11,7 +16,7 @@ import asyncio
 import threading
 from datetime import datetime
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -36,11 +41,11 @@ from .config import (
 )
 from .renderers import renderer_for
 
-GRID_COLS = 2
+GRID_COLS = 3
 
 
 def _clear(layout: QVBoxLayout) -> None:
-    """Delete every child widget/layout of ``layout`` (for flicker-free repopulation)."""
+    """Delete every child widget/layout of ``layout`` (flicker-free repopulation)."""
     while layout.count():
         item = layout.takeAt(0)
         child = item.widget() or item.layout()
@@ -55,10 +60,10 @@ def _clear(layout: QVBoxLayout) -> None:
 class Bridge(QObject):
     """Carries data from the background asyncio thread to the Qt main thread."""
 
-    frame = Signal(object)        # a merged snapshot frame
-    components = Signal(object)   # a manifest list
-    station = Signal(object)      # weather-station data
-    status = Signal(str, str)     # (text, class: live|degraded|disconnected)
+    frame = Signal(object)
+    components = Signal(object)
+    station = Signal(object)
+    status = Signal(str, str)
 
 
 class ComponentCard(QWidget):
@@ -69,8 +74,8 @@ class ComponentCard(QWidget):
         self.setObjectName("card")
         self._accent = accent
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(16, 12, 16, 14)
-        outer.setSpacing(8)
+        outer.setContentsMargins(14, 10, 14, 12)
+        outer.setSpacing(6)
 
         self.bar = QFrame()
         self.bar.setFixedHeight(3)
@@ -96,12 +101,11 @@ class ComponentCard(QWidget):
     def update(self, envelope: dict, manifest: dict) -> None:
         self.title.setText(manifest.get("display_name") or envelope.get("component_id", ""))
         self.cat.setText((manifest.get("category") or "").upper())
-        status = envelope.get("status")
         bar_color = {
             "ok": self._accent,
             "degraded": PALETTE["yellow"],
             "unreachable": PALETTE["orange"],
-        }.get(status, self._accent)
+        }.get(envelope.get("status"), self._accent)
         self.bar.setStyleSheet(f"background:{bar_color}; border:none;")
         _clear(self.body)
         renderer_for(envelope.get("component_id", "")).build_body(self.body, envelope.get("data"), manifest)
@@ -115,13 +119,16 @@ class WeatherStation(QWidget):
         super().__init__()
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2)
         self.temp = QLabel("—")
         self.temp.setObjectName("stationTemp")
+        self.temp.setAlignment(Qt.AlignRight)
         self.summary = QLabel("")
         self.summary.setObjectName("stationSummary")
+        self.summary.setAlignment(Qt.AlignRight)
         self.meta = QLabel("")
         self.meta.setObjectName("stationMeta")
+        self.meta.setAlignment(Qt.AlignRight)
         layout.addWidget(self.temp)
         layout.addWidget(self.summary)
         layout.addWidget(self.meta)
@@ -168,7 +175,7 @@ class BackgroundRunner(threading.Thread):
             try:
                 data = await weather.fetch(LATITUDE, LONGITUDE, WEATHER_REFRESH_SECONDS)
                 self.bridge.station.emit(data)
-            except Exception:  # noqa: BLE001 — keep the last station reading on failure
+            except Exception:  # noqa: BLE001 — keep the last reading on failure
                 pass
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=WEATHER_REFRESH_SECONDS)
@@ -191,8 +198,7 @@ class BackgroundRunner(threading.Thread):
 
     async def _components(self) -> None:
         try:
-            comps = await shell_client.fetch_components(SHELL_URL)
-            self.bridge.components.emit(comps)
+            self.bridge.components.emit(await shell_client.fetch_components(SHELL_URL))
         except Exception:  # noqa: BLE001
             pass
 
@@ -208,43 +214,49 @@ class MainWindow(QMainWindow):
         self._manifests: dict[str, dict] = {}
         self._cards: dict[str, ComponentCard] = {}
         self._order: list[str] = []
+        self._sized = False
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QHBoxLayout(central)
-        root.setContentsMargins(28, 24, 28, 24)
-        root.setSpacing(28)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(48, 16, 48, 8)
+        root.setSpacing(6)
 
-        # ── left column: clock + weather station + connection status ─────────
-        left = QVBoxLayout()
-        left.setSpacing(18)
+        # ── top row: stretch · centered clock+date · stretch · weather · cards ─
+        top = QHBoxLayout()
+        top.setSpacing(48)
+        top.addStretch(4)
+
+        center = QVBoxLayout()
+        center.setSpacing(2)
         self.clock = QLabel("")
-        self.clock.setObjectName("clock")
         self.date = QLabel("")
-        self.date.setObjectName("date")
-        left.addWidget(self.clock)
-        left.addWidget(self.date)
-        left.addSpacing(28)
-        self.station = WeatherStation()
-        left.addWidget(self.station)
-        left.addStretch()
-        self.conn = QLabel("starting…")
-        self.conn.setObjectName("conn")
-        left.addWidget(self.conn)
-        left_wrap = QWidget()
-        left_wrap.setLayout(left)
-        left_wrap.setFixedWidth(360)
-        root.addWidget(left_wrap)
+        center.addWidget(self._mk(self.clock, "clock", Qt.AlignCenter))
+        center.addWidget(self._mk(self.date, "date", Qt.AlignCenter))
+        top.addLayout(center)
 
-        # ── right: the dynamic component grid ─────────────────────────────────
+        top.addStretch(4)
+        self.station = WeatherStation()
+        top.addWidget(self.station, alignment=Qt.AlignVCenter)
+
+        # component cards (hidden until the backend is reachable)
         self.grid_host = QWidget()
         self.grid = QGridLayout(self.grid_host)
-        self.grid.setSpacing(16)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setWidget(self.grid_host)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        root.addWidget(scroll, 1)
+        self.grid.setSpacing(12)
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setWidget(self.grid_host)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setFixedWidth(560)
+        self.scroll.setVisible(False)
+        top.addWidget(self.scroll, alignment=Qt.AlignVCenter)
+
+        root.addLayout(top, 1)
+
+        # ── bottom: one-line status ────────────────────────────────────────────
+        self.conn = QLabel("starting…")
+        self.conn.setObjectName("conn")
+        root.addWidget(self.conn)
 
         # clock tick (pure main thread)
         self._timer = QTimer(self)
@@ -260,6 +272,33 @@ class MainWindow(QMainWindow):
         self.bridge.status.connect(self._on_status)
         self.runner = BackgroundRunner(self.bridge)
         self.runner.start()
+
+    @staticmethod
+    def _mk(label: QLabel, name: str, alignment: Qt.AlignmentFlag) -> QLabel:
+        label.setObjectName(name)
+        label.setAlignment(alignment)
+        return label
+
+    # ── screen-adaptive font sizing (clock fills a short display) ──────────────
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        super().showEvent(event)
+        if not self._sized:
+            self._apply_sizes()
+            self._sized = True
+
+    def _apply_sizes(self) -> None:
+        screen = self.screen()
+        height = screen.size().height() if screen else 480
+
+        def scale(label: QLabel, ratio: float, lo: int, hi: int) -> None:
+            font = label.font()
+            font.setPixelSize(max(lo, min(int(height * ratio), hi)))
+            label.setFont(font)
+
+        scale(self.clock, 0.55, 120, 360)        # the hero — fills the height
+        scale(self.date, 0.07, 14, 30)
+        scale(self.station.temp, 0.30, 56, 150)
+        scale(self.station.summary, 0.06, 14, 26)
 
     # ── slots (run on the main thread) ─────────────────────────────────────────
     def _tick(self) -> None:
@@ -326,6 +365,7 @@ class MainWindow(QMainWindow):
         for i, cid in enumerate(self._order):
             if cid in self._cards:
                 self.grid.addWidget(self._cards[cid], i // GRID_COLS, i % GRID_COLS)
+        self.scroll.setVisible(bool(self._cards))   # hidden when backend is down
 
     def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
         self.runner.stop()

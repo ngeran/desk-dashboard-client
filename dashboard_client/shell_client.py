@@ -1,7 +1,9 @@
 """Consumes the shell: GET /components + WS /stream, with reconnect.
 
-Pure async, no Qt. The UI runs this in a background thread and receives frames /
-status via plain (thread-safe) callbacks — the UI side emits Qt signals.
+Pure async, no Qt. The UI runs this in a background thread and receives short
+status labels + frames via plain (thread-safe) callbacks — the UI emits Qt
+signals. The actual exception on disconnect is logged at debug, not shown on
+screen (the status line just says "offline").
 """
 from __future__ import annotations
 
@@ -10,7 +12,10 @@ import json
 from collections.abc import Callable
 
 import httpx
+import structlog
 import websockets
+
+log = structlog.get_logger(__name__)
 
 
 async def fetch_components(shell_url: str) -> list[dict]:
@@ -43,7 +48,8 @@ async def stream(
                         return
                     on_frame(json.loads(message))
         except Exception as exc:  # noqa: BLE001 — boundary: reconnect, don't die
-            on_status(f"disconnected · {exc}", "disconnected")
+            log.debug("shell.disconnected", error=str(exc))
+            on_status("offline", "disconnected")
             try:
                 await asyncio.wait_for(asyncio.shield(stop.wait()), timeout=2.0)
                 return
