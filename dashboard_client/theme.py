@@ -1,49 +1,28 @@
-"""Qt stylesheet (QSS) built from the QD-OLED palette.
+"""Qt stylesheet (QSS) — fastfetch-style modular panels on pure black.
 
-Pure-black surfaces, hairline borders, dim labels, vivid colour only on content.
-Selectors target objectNames (QSS supports ``#name``), set in the widget code.
+Pure-black surfaces, hairline borders, mono labels/values, vivid colour only on
+content/accents. Selectors target objectNames set in ui.py. Font *sizes* are set
+per-screen in ui.py (_apply_sizes); families + base styling live here.
 """
 from __future__ import annotations
 
 from .config import PALETTE as P
 
 QSS = f"""
-* {{ color: {P["text"]}; font-family: "JetBrains Mono", "JetBrains Mono NL", monospace; }}
 QMainWindow, QWidget {{ background: {P["black"]}; }}
-QLabel {{ background: transparent; }}
+QLabel {{ background: transparent; color: {P["text"]}; }}
 
-#clock {{ font-size: 104px; font-weight: 200; }}
-#date   {{ font-size: 22px; color: {P["dim"]}; font-weight: 400; }}
-#conn   {{ font-size: 13px; color: {P["dim"]}; }}
+#panel       {{ border: 1px solid {P["border"]}; border-radius: 14px; }}
+#panelTitle  {{ font-size: 13px; font-weight: 700; letter-spacing: 2px; color: {P["text"]}; }}
+#panelBadge  {{ font-size: 11px; font-weight: 700; letter-spacing: 1px; }}
 
-#card {{
-    border: 1px solid {P["border"]};
-    border-radius: 14px;
-    background: {P["panel"]};
-}}
-#cardTitle  {{ font-size: 15px; font-weight: 600; }}
-#cardCat    {{ font-size: 11px; font-weight: 600; }}
-#k          {{ color: {P["dim"]}; font-size: 13px; }}
-#v          {{ color: {P["text"]}; font-size: 14px; font-weight: 500; }}
-#section-label {{ font-size: 12px; color: {P["text"]}; font-weight: 600; }}
+#k          {{ color: {P["dim"]}; font-family: "DejaVu Sans Mono","Liberation Mono",monospace; font-size: 13px; }}
+#v          {{ color: {P["text"]}; font-family: "DejaVu Sans Mono","Liberation Mono",monospace; font-size: 14px; }}
+#clockBig   {{ color: {P["text"]}; font-family: "DejaVu Sans","Liberation Sans",sans-serif; font-weight: 200; }}
+#date       {{ color: {P["dim"]}; font-family: "DejaVu Sans","Liberation Sans",sans-serif; font-size: 20px; letter-spacing: 1px; }}
 
-#stationTemp    {{ font-size: 84px; font-weight: 200; }}
-#stationSummary {{ font-size: 20px; font-weight: 400; }}
-#stationMeta    {{ color: {P["dim"]}; font-size: 14px; }}
-#stationDelta   {{ font-size: 13px; font-weight: 600; }}
+#conn       {{ color: {P["dim"]}; font-size: 12px; font-family: "DejaVu Sans Mono",monospace; letter-spacing: 1px; }}
 
-QScrollArea {{ border: none; background: transparent; }}
-QScrollArea > QWidget > QWidget {{ background: transparent; }}
-QScrollBar:vertical {{
-    background: transparent;
-    width: 4px;
-    margin: 0;
-}}
-QScrollBar::handle:vertical {{
-    background: {P["border"]};
-    border-radius: 2px;
-    min-height: 24px;
-}}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-QScrollBar::add-page, QScrollBar::sub-page {{ background: transparent; }}
+QProgressBar {{ background: #161616; border: none; border-radius: 2px; max-height: 4px; }}
+QScrollArea, QScrollBar {{ border: none; background: transparent; }}
 """

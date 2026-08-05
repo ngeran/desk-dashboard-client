@@ -1,14 +1,13 @@
-"""The Qt interface — a clock-first display sized to the screen.
+"""The Qt interface — three fastfetch-style panels across the strip.
 
-Layout is built for a wide strip (e.g. 1920×480): a large centered clock with the
-date beneath it, the weather station to the right, component cards further right
-(only when the backend is up), and a one-line status at the bottom. Fonts scale to
-the screen so the clock fills a short display. The screen is never blank: the
-clock + weather station are local, so they render even with the backend down.
+Clock (local, always live), Weather (local Open-Meteo, always live) and Calendar
+(backend-driven; shows an OFFLINE state until the shell is up). The screen is
+never blank: the first two panels render with no backend.
 
-Thread model: Qt event loop on the main thread; a background asyncio thread
-fetches weather and consumes the shell's WS stream, pushing results in via Qt
-signals (thread-safe, queued to the main thread).
+Layout = one row of three equal panels, sized for a wide strip (e.g. 1920×480);
+fonts scale to the screen. Thread model: Qt loop on the main thread; a background
+asyncio thread fetches weather and consumes the shell's WS stream, pushing data in
+via Qt signals (thread-safe, queued to the main thread).
 """
 from __future__ import annotations
 
@@ -16,41 +15,24 @@ import asyncio
 import threading
 from datetime import datetime
 
-from PySide6.QtCore import QEasingCurve, QObject, QPropertyAnimation, Qt, QTimer, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QFrame,
-    QGraphicsDropShadowEffect,
-    QGraphicsOpacityEffect,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QMainWindow,
-    QScrollArea,
+    QProgressBar,
     QVBoxLayout,
     QWidget,
 )
 
 from . import shell_client, weather
-from .config import (
-    ACCENT,
-    CATEGORY_COLORS,
-    CLOCK_FORMAT,
-    DATE_FORMAT,
-    LATITUDE,
-    LONGITUDE,
-    PALETTE,
-    SHELL_URL,
-    WEATHER_REFRESH_SECONDS,
-)
-from .renderers import renderer_for
-from .widgets import DayProgressBar, PulseDot
-
-GRID_COLS = 3
+from .config import LATITUDE, LONGITUDE, PALETTE, SHELL_URL, WEATHER_REFRESH_SECONDS
+from .renderers.formatting import weather_text
 
 
 def _clear(layout: QVBoxLayout) -> None:
-    """Delete every child widget/layout of ``layout`` (flicker-free repopulation)."""
+    """Delete every child widget/layout of ``layout`` (for repopulation)."""
     while layout.count():
         item = layout.takeAt(0)
         child = item.widget() or item.layout()
@@ -62,122 +44,222 @@ def _clear(layout: QVBoxLayout) -> None:
             child.deleteLater()
 
 
-class Bridge(QObject):
-    """Carries data from the background asyncio thread to the Qt main thread."""
+def _bar(accent: str, width: int | None = None) -> QProgressBar:
+    """A thin, label-less progress bar with an accent-coloured fill."""
+    bar = QProgressBar()
+    bar.setRange(0, 100)
+    bar.setTextVisible(False)
+    bar.setFixedHeight(4)
+    bar.setStyleSheet(
+        f"QProgressBar{{background:#161616;border:none;border-radius:2px}}"
+        f"QProgressBar::chunk{{background:{accent};border-radius:2px}}"
+    )
+    if width is not None:
+        bar.setFixedWidth(width)
+    return bar
 
+
+class Panel(QFrame):
+    """A bordered card: header (accent square + title + LIVE/OFFLINE badge) + body."""
+
+    def __init__(self, title: str, accent: str) -> None:
+        super().__init__()
+        self.setObjectName("panel")
+        self._accent = accent
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(22, 18, 22, 18)
+        outer.setSpacing(12)
+
+        header = QHBoxLayout()
+        header.setSpacing(9)
+        square = QFrame()
+        square.setFixedSize(12, 12)
+        square.setStyleSheet(f"background:{accent};border-radius:2px;")
+        title_label = QLabel(title)
+        title_label.setObjectName("panelTitle")
+        header.addWidget(square)
+        header.addWidget(title_label)
+        header.addStretch()
+        self.badge = QLabel("")
+        self.badge.setObjectName("panelBadge")
+        header.addWidget(self.badge)
+        self.set_live(False)
+        outer.addLayout(header)
+
+        self.body = QVBoxLayout()
+        self.body.setContentsMargins(0, 6, 0, 0)
+        self.body.setSpacing(6)
+        outer.addLayout(self.body)
+
+    def set_live(self, live: bool) -> None:
+        self.badge.setText("● LIVE" if live else "○ OFFLINE")
+        self.badge.setStyleSheet(f"color:{self._accent if live else '#5a5f68'};")
+
+
+class ClockPanel(Panel):
+    def __init__(self) -> None:
+        super().__init__("CLOCK", PALETTE["blue"])
+        self.set_live(True)  # always local
+        self.time = QLabel("")
+        self.time.setObjectName("clockBig")
+        self.time.setAlignment(Qt.AlignCenter)
+        self.date = QLabel("")
+        self.date.setObjectName("date")
+        self.date.setAlignment(Qt.AlignCenter)
+        self.day_bar = _bar(PALETTE["blue"])
+        self.day_label = QLabel("")
+        self.day_label.setObjectName("k")
+        self.body.addStretch()
+        self.body.addWidget(self.time)
+        self.body.addWidget(self.date)
+        self.body.addStretch()
+        day_row = QHBoxLayout()
+        day_row.setSpacing(12)
+        day_row.addWidget(self.day_label)
+        day_row.addWidget(self.day_bar, 1)
+        self.body.addLayout(day_row)
+        self.tick()
+
+    def tick(self) -> None:
+        now = datetime.now()
+        self.time.setText(now.strftime("%H:%M"))
+        self.date.setText(now.strftime("%A %e %B"))
+        secs = now.hour * 3600 + now.minute * 60 + now.second
+        pct = int(secs / 86400 * 100)
+        self.day_bar.setValue(pct)
+        self.day_label.setText(f"DAY {pct}%")
+
+
+class WeatherPanel(Panel):
+    def __init__(self) -> None:
+        super().__init__("WEATHER", PALETTE["green"])
+        self.temp = QLabel("—")
+        self.temp.setObjectName("clockBig")
+        self.temp.setAlignment(Qt.AlignCenter)
+        self.cond = QLabel("")
+        self.cond.setObjectName("v")
+        self.cond.setAlignment(Qt.AlignCenter)
+        self.feels_v = QLabel("—")
+        self.feels_v.setObjectName("v")
+        self.wind_v = QLabel("—")
+        self.wind_v.setObjectName("v")
+        self.hum_bar = _bar(PALETTE["green"])
+        self.hum_label = QLabel("")
+        self.hum_label.setObjectName("k")
+        self.body.addStretch()
+        self.body.addWidget(self.temp)
+        self.body.addWidget(self.cond)
+        self.body.addStretch()
+        self.body.addLayout(self._row("FEELS", self.feels_v))
+        self.body.addLayout(self._row("WIND", self.wind_v))
+        hum_row = QHBoxLayout()
+        hum_row.setSpacing(12)
+        hum_row.addWidget(self.hum_label)
+        hum_row.addWidget(self.hum_bar, 1)
+        self.body.addLayout(hum_row)
+
+    @staticmethod
+    def _row(label: str, value: QLabel) -> QHBoxLayout:
+        row = QHBoxLayout()
+        key = QLabel(label)
+        key.setObjectName("k")
+        value.setAlignment(Qt.AlignRight)
+        row.addWidget(key)
+        row.addStretch()
+        row.addWidget(value)
+        return row
+
+    def update(self, data: dict) -> None:
+        self.set_live(True)
+        temp = data.get("temperature")
+        self.temp.setText(f"{temp:.0f}°" if temp is not None else "—")
+        label, glyph = weather_text(data.get("code"))
+        self.cond.setText(f"{glyph}  {label}")
+        apparent = data.get("apparent")
+        self.feels_v.setText(f"{apparent:.0f}°" if apparent is not None else "—")
+        wind = data.get("wind_speed")
+        self.wind_v.setText(f"{wind:.0f} km/h" if wind is not None else "—")
+        humidity = data.get("humidity")
+        if humidity is not None:
+            self.hum_bar.setValue(int(humidity))
+            self.hum_label.setText(f"HUMIDITY {int(humidity)}%")
+        else:
+            self.hum_bar.setValue(0)
+            self.hum_label.setText("HUMIDITY —")
+
+
+class CalendarPanel(Panel):
+    def __init__(self) -> None:
+        super().__init__("CALENDAR", PALETTE["purple"])
+        self._show_empty("offline")
+
+    def _show_empty(self, reason: str) -> None:
+        _clear(self.body)
+        label = QLabel(reason)
+        label.setObjectName("k")
+        label.setAlignment(Qt.AlignCenter)
+        self.body.addStretch()
+        self.body.addWidget(label)
+        self.body.addStretch()
+
+    def update(self, events: list[dict] | None) -> None:
+        events = events or []
+        if not events:
+            self._show_empty("no upcoming events")
+            return
+        self.set_live(True)
+        _clear(self.body)
+        today = datetime.now().date()
+        shown = 0
+        groups: dict = {}
+        for ev in events:
+            start = self._parse(ev.get("start"))
+            if start is None:
+                continue
+            groups.setdefault(start.date(), []).append((start, ev))
+        for day in sorted(groups):
+            if shown >= 12:
+                break
+            days_away = (day - today).days
+            head = "TODAY" if days_away == 0 else "TOMORROW" if days_away == 1 else day.strftime("%a %d %b").upper()
+            head_label = QLabel(head)
+            head_label.setObjectName("panelTitle")
+            head_label.setStyleSheet(f"color:{PALETTE['purple']};")
+            self.body.addWidget(head_label)
+            for start, ev in groups[day]:
+                if shown >= 12:
+                    break
+                shown += 1
+                when = "all day" if ev.get("all_day") else start.strftime("%H:%M")
+                when_label = QLabel(when)
+                when_label.setObjectName("v")
+                summary = QLabel(str(ev.get("summary") or "(no title)"))
+                summary.setObjectName("k")
+                summary.setWordWrap(True)
+                row = QHBoxLayout()
+                row.setSpacing(10)
+                row.addWidget(when_label)
+                row.addWidget(summary, 1)
+                self.body.addLayout(row)
+        self.body.addStretch()
+
+    @staticmethod
+    def _parse(value) -> datetime | None:
+        if value is None:
+            return None
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+
+class Bridge(QObject):
     frame = Signal(object)
-    components = Signal(object)
     station = Signal(object)
     status = Signal(str, str)
 
 
-class ComponentCard(QWidget):
-    """One component's card. Chrome is stable; the body is repopulated each frame."""
-
-    def __init__(self, accent: str) -> None:
-        super().__init__()
-        self.setObjectName("card")
-        self._accent = accent
-        outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 10, 14, 12)
-        outer.setSpacing(6)
-
-        self.bar = QFrame()
-        self.bar.setFixedHeight(3)
-        self.bar.setStyleSheet(f"background:{accent}; border:none; border-radius:1px;")
-        outer.addWidget(self.bar)
-
-        header = QHBoxLayout()
-        self.title = QLabel("")
-        self.title.setObjectName("cardTitle")
-        self.cat = QLabel("")
-        self.cat.setObjectName("cardCat")
-        self.cat.setStyleSheet(f"color:{accent};")
-        header.addWidget(self.title)
-        header.addStretch()
-        header.addWidget(self.cat)
-        outer.addLayout(header)
-
-        self.body = QVBoxLayout()
-        self.body.setContentsMargins(0, 4, 0, 0)
-        self.body.setSpacing(2)
-        outer.addLayout(self.body)
-
-    def update(self, envelope: dict, manifest: dict) -> None:
-        self.title.setText(manifest.get("display_name") or envelope.get("component_id", ""))
-        self.cat.setText((manifest.get("category") or "").upper())
-        bar_color = {
-            "ok": self._accent,
-            "degraded": PALETTE["yellow"],
-            "unreachable": PALETTE["orange"],
-        }.get(envelope.get("status"), self._accent)
-        # A fading gradient reads richer than a flat bar and gives the eye a
-        # direction — the card's "source" is the left edge, colour trails off.
-        self.bar.setStyleSheet(
-            "background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
-            f"stop:0 {bar_color}, stop:0.6 {bar_color}, stop:1 transparent); "
-            "border:none; border-radius:1px;"
-        )
-        _clear(self.body)
-        renderer_for(envelope.get("component_id", "")).build_body(self.body, envelope.get("data"), manifest)
-        self.setVisible(True)
-
-
-class WeatherStation(QWidget):
-    """The always-on local weather panel (fetched directly; survives backend outages)."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)
-        self.temp = QLabel("—")
-        self.temp.setObjectName("stationTemp")
-        self.temp.setAlignment(Qt.AlignRight)
-        self.summary = QLabel("")
-        self.summary.setObjectName("stationSummary")
-        self.summary.setAlignment(Qt.AlignRight)
-        self.meta = QLabel("")
-        self.meta.setObjectName("stationMeta")
-        self.meta.setAlignment(Qt.AlignRight)
-        layout.addWidget(self.temp)
-        layout.addWidget(self.summary)
-        layout.addWidget(self.meta)
-        layout.addStretch()
-
-        glow = QGraphicsDropShadowEffect(self.temp)
-        glow.setColor(QColor(ACCENT))
-        glow.setBlurRadius(28)
-        glow.setOffset(0, 0)
-        self.temp.setGraphicsEffect(glow)
-
-    def update(self, data: dict) -> None:
-        from .renderers.formatting import weather_text
-
-        temp = data.get("temperature")
-        self.temp.setText(f"{temp:.0f}°" if temp is not None else "—")
-        label, glyph = weather_text(data.get("code"))
-        self.summary.setText(f"{glyph}  {label}")
-        parts = []
-        apparent = data.get("apparent")
-        if apparent is not None and temp is not None:
-            delta = apparent - temp
-            if abs(delta) >= 1:
-                arrow = "▲" if delta > 0 else "▼"
-                color = PALETTE["orange"] if delta > 0 else PALETTE["blue"]
-                parts.append(f'feels {apparent:.0f}° <span style="color:{color};">{arrow}</span>')
-            else:
-                parts.append(f"feels {apparent:.0f}°")
-        if data.get("humidity") is not None:
-            parts.append(f"{data['humidity']:.0f}% hum")
-        if data.get("wind_speed") is not None:
-            parts.append(f"{data['wind_speed']:.0f} km/h")
-        self.meta.setText("   ".join(parts))
-
-
 class BackgroundRunner(threading.Thread):
-    """Runs weather + shell consumption on a background asyncio loop."""
-
     def __init__(self, bridge: Bridge) -> None:
         super().__init__(daemon=True)
         self.bridge = bridge
@@ -186,7 +268,7 @@ class BackgroundRunner(threading.Thread):
     def run(self) -> None:
         try:
             asyncio.run(self._main())
-        except Exception:  # noqa: BLE001 — never crash the UI thread's sibling
+        except Exception:  # noqa: BLE001
             pass
 
     async def _main(self) -> None:
@@ -197,8 +279,7 @@ class BackgroundRunner(threading.Thread):
         assert self._stop is not None
         while not self._stop.is_set():
             try:
-                data = await weather.fetch(LATITUDE, LONGITUDE, WEATHER_REFRESH_SECONDS)
-                self.bridge.station.emit(data)
+                self.bridge.station.emit(await weather.fetch(LATITUDE, LONGITUDE, WEATHER_REFRESH_SECONDS))
             except Exception:  # noqa: BLE001 — keep the last reading on failure
                 pass
             try:
@@ -215,16 +296,8 @@ class BackgroundRunner(threading.Thread):
 
         def on_status(text: str, cls: str) -> None:
             self.bridge.status.emit(text, cls)
-            if cls == "live":
-                asyncio.create_task(self._components())  # noqa: RUF006
 
         await shell_client.stream(SHELL_URL, on_frame, on_status, self._stop)
-
-    async def _components(self) -> None:
-        try:
-            self.bridge.components.emit(await shell_client.fetch_components(SHELL_URL))
-        except Exception:  # noqa: BLE001
-            pass
 
     def stop(self) -> None:
         if self._stop is not None:
@@ -235,97 +308,42 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("desk-dashboard")
-        self._manifests: dict[str, dict] = {}
-        self._cards: dict[str, ComponentCard] = {}
-        self._order: list[str] = []
         self._sized = False
 
         central = QWidget()
         self.setCentralWidget(central)
-        root = QVBoxLayout(central)
-        root.setContentsMargins(48, 16, 48, 8)
-        root.setSpacing(6)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(20, 14, 20, 8)
+        outer.setSpacing(10)
 
-        # ── top row: stretch · centered clock+date · stretch · weather · cards ─
-        top = QHBoxLayout()
-        top.setSpacing(48)
-        top.addStretch(4)
+        row = QHBoxLayout()
+        row.setSpacing(16)
+        self.clock_panel = ClockPanel()
+        self.weather_panel = WeatherPanel()
+        self.calendar_panel = CalendarPanel()
+        row.addWidget(self.clock_panel, 1)
+        row.addWidget(self.weather_panel, 1)
+        row.addWidget(self.calendar_panel, 1)
+        outer.addLayout(row, 1)
 
-        center = QVBoxLayout()
-        center.setSpacing(2)
-        self.clock = QLabel("")
-        self.date = QLabel("")
-        center.addWidget(self._mk(self.clock, "clock", Qt.AlignCenter))
-        center.addWidget(self._mk(self.date, "date", Qt.AlignCenter))
-
-        # A hairline gradient bar tracking how much of the day has elapsed —
-        # ambient, not a headline element, but it makes the clock feel like
-        # it's tracking time rather than just displaying it.
-        self.day_bar = DayProgressBar(ACCENT)
-        center.addSpacing(6)
-        center.addWidget(self.day_bar)
-        top.addLayout(center)
-
-        # Soft content-only glow on the hero clock — no filled panel behind
-        # it, so it stays OLED-safe while giving the display a focal point.
-        clock_glow = QGraphicsDropShadowEffect(self.clock)
-        clock_glow.setColor(QColor(ACCENT))
-        clock_glow.setBlurRadius(48)
-        clock_glow.setOffset(0, 0)
-        self.clock.setGraphicsEffect(clock_glow)
-
-        top.addStretch(4)
-        self.station = WeatherStation()
-        top.addWidget(self.station, alignment=Qt.AlignVCenter)
-
-        # component cards (hidden until the backend is reachable)
-        self.grid_host = QWidget()
-        self.grid = QGridLayout(self.grid_host)
-        self.grid.setSpacing(12)
-        self.scroll = QScrollArea()
-        self.scroll.setWidgetResizable(True)
-        self.scroll.setWidget(self.grid_host)
-        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
-        self.scroll.setFixedWidth(560)
-        self.scroll.setVisible(False)
-        top.addWidget(self.scroll, alignment=Qt.AlignVCenter)
-
-        root.addLayout(top, 1)
-
-        # ── bottom: one-line status, led by a breathing dot when live ─────────
-        status_row = QHBoxLayout()
-        status_row.setSpacing(8)
-        self.status_dot = PulseDot(PALETTE["dim"])
         self.conn = QLabel("starting…")
         self.conn.setObjectName("conn")
-        status_row.addWidget(self.status_dot, alignment=Qt.AlignVCenter)
-        status_row.addWidget(self.conn, alignment=Qt.AlignVCenter)
-        status_row.addStretch()
-        root.addLayout(status_row)
+        outer.addWidget(self.conn)
 
-        # clock tick (pure main thread)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._tick)
         self._timer.start(1000)
         self._tick()
 
-        # background data
         self.bridge = Bridge()
         self.bridge.frame.connect(self._on_frame)
-        self.bridge.components.connect(self._on_components)
         self.bridge.station.connect(self._on_station)
         self.bridge.status.connect(self._on_status)
         self.runner = BackgroundRunner(self.bridge)
         self.runner.start()
 
-    @staticmethod
-    def _mk(label: QLabel, name: str, alignment: Qt.AlignmentFlag) -> QLabel:
-        label.setObjectName(name)
-        label.setAlignment(alignment)
-        return label
-
-    # ── screen-adaptive font sizing (clock fills a short display) ──────────────
-    def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
+    # ── screen-adaptive sizing ─────────────────────────────────────────────────
+    def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         if not self._sized:
             self._apply_sizes()
@@ -340,27 +358,17 @@ class MainWindow(QMainWindow):
             font.setPixelSize(max(lo, min(int(height * ratio), hi)))
             label.setFont(font)
 
-        scale(self.clock, 0.55, 120, 360)        # the hero — fills the height
-        scale(self.date, 0.07, 14, 30)
-        scale(self.station.temp, 0.30, 56, 150)
-        scale(self.station.summary, 0.06, 14, 26)
+        scale(self.clock_panel.time, 0.40, 80, 220)
+        scale(self.clock_panel.date, 0.06, 12, 22)
+        scale(self.weather_panel.temp, 0.30, 56, 150)
+        scale(self.weather_panel.cond, 0.06, 12, 26)
 
-    # ── slots (run on the main thread) ─────────────────────────────────────────
+    # ── slots ──────────────────────────────────────────────────────────────────
     def _tick(self) -> None:
-        now = datetime.now()
-        time_str = now.strftime(CLOCK_FORMAT)
-        if ":" in time_str:
-            # Blink the colon on whole seconds — a small live-ness cue that
-            # doesn't shift layout (the glyph stays, only its colour changes).
-            colon_color = PALETTE["text"] if now.second % 2 == 0 else PALETTE["border"]
-            time_str = time_str.replace(":", f'<span style="color:{colon_color};">:</span>')
-        self.clock.setText(time_str)
-        self.date.setText(now.strftime(DATE_FORMAT))
-        elapsed = now.hour * 3600 + now.minute * 60 + now.second
-        self.day_bar.set_fraction(elapsed / 86400)
+        self.clock_panel.tick()
 
     def _on_station(self, data: dict) -> None:
-        self.station.update(data)
+        self.weather_panel.update(data)
 
     def _on_status(self, text: str, cls: str) -> None:
         self.conn.setText(text)
@@ -370,73 +378,14 @@ class MainWindow(QMainWindow):
             "disconnected": PALETTE["orange"],
         }.get(cls, PALETTE["dim"])
         self.conn.setStyleSheet(f"color:{color};")
-        self.status_dot.set_color(color)
-        self.status_dot.set_active(cls == "live")
-
-    def _on_components(self, comps: list[dict]) -> None:
-        self._manifests = {c["id"]: c for c in comps}
-        changed = False
-        for cid in [c["id"] for c in comps]:
-            if cid not in self._cards:
-                self._add_card(cid)
-                changed = True
-        if changed:
-            self._reflow()
 
     def _on_frame(self, frame: dict) -> None:
-        comps = frame.get("components", {})
-        ids = list(comps.keys())
-        changed = False
-        for cid in ids:
-            if cid not in self._cards:
-                self._add_card(cid)
-                changed = True
-        for cid in [c for c in list(self._cards) if c not in ids]:
-            self._remove_card(cid)
-            changed = True
-        for cid, env in comps.items():
-            self._cards[cid].update(env, self._manifests.get(cid, {"id": cid}))
-        if changed:
-            self._reflow()
+        components = frame.get("components", {})
+        calendar = components.get("calendar")
+        if calendar is not None:
+            data = calendar.get("data")
+            self.calendar_panel.update(data.get("upcoming") if isinstance(data, dict) else None)
 
-    # ── card grid management ───────────────────────────────────────────────────
-    def _add_card(self, cid: str) -> None:
-        manifest = self._manifests.get(cid, {})
-        accent = CATEGORY_COLORS.get(manifest.get("category"), PALETTE["blue"])
-        card = ComponentCard(accent)
-        self._cards[cid] = card
-        self._order.append(cid)
-        self._fade_in(card)
-
-    @staticmethod
-    def _fade_in(widget: QWidget) -> None:
-        """Soft fade-in for newly appearing cards instead of a hard pop-in."""
-        effect = QGraphicsOpacityEffect(widget)
-        widget.setGraphicsEffect(effect)
-        anim = QPropertyAnimation(effect, b"opacity", widget)
-        anim.setDuration(420)
-        anim.setStartValue(0.0)
-        anim.setEndValue(1.0)
-        anim.setEasingCurve(QEasingCurve.Type.OutCubic)
-        widget._fade_anim = anim  # keep a reference alive for the animation's duration
-        anim.start()
-
-    def _remove_card(self, cid: str) -> None:
-        card = self._cards.pop(cid, None)
-        if card is not None:
-            self.grid.removeWidget(card)
-            card.deleteLater()
-        if cid in self._order:
-            self._order.remove(cid)
-
-    def _reflow(self) -> None:
-        for card in self._cards.values():
-            self.grid.removeWidget(card)
-        for i, cid in enumerate(self._order):
-            if cid in self._cards:
-                self.grid.addWidget(self._cards[cid], i // GRID_COLS, i % GRID_COLS)
-        self.scroll.setVisible(bool(self._cards))   # hidden when backend is down
-
-    def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+    def closeEvent(self, event) -> None:  # noqa: N802
         self.runner.stop()
         super().closeEvent(event)
