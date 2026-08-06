@@ -37,9 +37,11 @@ LATITUDE = env_float("LATITUDE", 40.4168)
 LONGITUDE = env_float("LONGITUDE", -3.7038)
 WEATHER_REFRESH_SECONDS = env_int("WEATHER_REFRESH_SECONDS", 600)
 CLOCK_FORMAT = env("CLOCK_FORMAT", "%H:%M")     # big clock
-# Clock font (any bundled under assets/fonts/): "Major Mono Display",
-# "Share Tech Mono", "VT323". Override with the CLOCK_FONT env var.
-CLOCK_FONT = env("CLOCK_FONT", "Major Mono Display")
+# Clock font — any bundled under assets/fonts/:
+#   "Cantarell", "Smooch Sans", "Stack Sans Text",
+#   "Major Mono Display", "Share Tech Mono", "VT323".
+# Override with the CLOCK_FONT env var (substring match is fine).
+CLOCK_FONT = env("CLOCK_FONT", "Cantarell")
 DATE_FORMAT = env("DATE_FORMAT", "%A %e %B")    # under the clock
 
 # QD-OLED palette: pure black + vivid accents.
